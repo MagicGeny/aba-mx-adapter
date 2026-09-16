@@ -333,7 +333,7 @@ class MaxWorkerDaemon:
                 self._ws_forwarder_task = None
             await self.browser_manager.stop()
             await self.http_client.aclose()
-
+#just main
 if __name__ == "__main__":
     daemon = MaxWorkerDaemon()
     try:
