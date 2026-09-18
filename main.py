@@ -40,6 +40,7 @@ import httpx
 from pydantic import BaseModel, Field
 from max_playwright_sender import (
     MaxBrowserManager,
+    _task_correlation,
     logger,
     normalize_phone_for_max,
 )
@@ -242,66 +243,67 @@ class MaxWorkerDaemon:
                 task = SendTask(**body)
                 logger.info(f"Processing send task: {task.task_id} for {task.phone} (attachment_url={task.attachment_url!r}, attachment_name={task.attachment_name!r})")
 
-                phone = normalize_phone_for_max(task.phone)
-                if not phone:
-                    await self.send_callback(CallbackPayload(
-                        task_id=task.task_id,
-                        status="failed",
-                        error_message="Invalid phone format"
-                    ))
-                    return
+                with _task_correlation(task.task_id, task.tenant_id or None):
+                    phone = normalize_phone_for_max(task.phone)
+                    if not phone:
+                        await self.send_callback(CallbackPayload(
+                            task_id=task.task_id,
+                            status="failed",
+                            error_message="Invalid phone format"
+                        ))
+                        return
 
-                attachment_path: Optional[str] = None
-                try:
-                    attachment_path = await self.media_cache.ensure_campaign_media(
-                        campaign_id=task.campaign_id,
-                        attachment_url=task.attachment_url,
-                        attachment_name=task.attachment_name,
+                    attachment_path: Optional[str] = None
+                    try:
+                        attachment_path = await self.media_cache.ensure_campaign_media(
+                            campaign_id=task.campaign_id,
+                            attachment_url=task.attachment_url,
+                            attachment_name=task.attachment_name,
+                        )
+                    except Exception as e:
+                        await self.send_callback(CallbackPayload(
+                            task_id=task.task_id,
+                            status="failed",
+                            error_message=f"Attachment download failed: {e}"
+                        ))
+                        return
+
+                    result = await self.browser_manager.send_message(
+                        phone,
+                        task.message_text,
+                        attachment_path=attachment_path,
+                        chat_id=task.chat_id,
+                        use_chat_id=bool(task.use_chat_id and task.chat_id),
                     )
-                except Exception as e:
                     await self.send_callback(CallbackPayload(
                         task_id=task.task_id,
-                        status="failed",
-                        error_message=f"Attachment download failed: {e}"
+                        status=result.status_note,
+                        error_message=result.error_message
                     ))
-                    return
 
-                result = await self.browser_manager.send_message(
-                    phone,
-                    task.message_text,
-                    attachment_path=attachment_path,
-                    chat_id=task.chat_id,
-                    use_chat_id=bool(task.use_chat_id and task.chat_id),
-                )
-                await self.send_callback(CallbackPayload(
-                    task_id=task.task_id,
-                    status=result.status_note,
-                    error_message=result.error_message
-                ))
+                    if result.status_note == "user_not_found_by_phone":
+                        await self.publish_result(TargetResult(
+                            target_id=task.task_id,
+                            campaign_id=task.campaign_id,
+                            phone_number=phone,
+                            status="user_not_found_by_phone",
+                            timestamp=datetime.utcnow().isoformat() + "Z",
+                        ))
+                        logger.info(f"Soft-fail USER_NOT_FOUND_BY_PHONE for target {task.task_id} phone={phone}")
+                        return
 
-                if result.status_note == "user_not_found_by_phone":
-                    await self.publish_result(TargetResult(
-                        target_id=task.task_id,
-                        campaign_id=task.campaign_id,
-                        phone_number=phone,
-                        status="user_not_found_by_phone",
-                        timestamp=datetime.utcnow().isoformat() + "Z",
-                    ))
-                    logger.info(f"Soft-fail USER_NOT_FOUND_BY_PHONE for target {task.task_id} phone={phone}")
-                    return
-
-                # Now, also publish to RESULTS_QUEUE with "sent" status!
-                if result.sent_ok:
-                    if not result.chat_id:
-                        logger.error(f"Send succeeded but chat_id not captured for target {task.task_id} phone={phone}")
-                    await self.publish_result(TargetResult(
-                        target_id=task.task_id,
-                        campaign_id=task.campaign_id,
-                        phone_number=phone,
-                        status="sent",
-                        timestamp=datetime.utcnow().isoformat() + "Z",
-                        chat_id=result.chat_id
-                    ))
+                    # Now, also publish to RESULTS_QUEUE with "sent" status!
+                    if result.sent_ok:
+                        if not result.chat_id:
+                            logger.error(f"Send succeeded but chat_id not captured for target {task.task_id} phone={phone}")
+                        await self.publish_result(TargetResult(
+                            target_id=task.task_id,
+                            campaign_id=task.campaign_id,
+                            phone_number=phone,
+                            status="sent",
+                            timestamp=datetime.utcnow().isoformat() + "Z",
+                            chat_id=result.chat_id
+                        ))
 
             except Exception as e:
                 logger.exception("Error in process_send_task")

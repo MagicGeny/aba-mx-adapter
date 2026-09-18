@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import contextvars
+from contextlib import contextmanager
 from collections import OrderedDict
 import importlib.metadata
 import inspect
@@ -13,8 +15,9 @@ import sys
 import traceback
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Union
+from typing import Any, Dict, Iterable, List, NoReturn, Optional, Tuple, Union
 
 from playwright.async_api import (
     Browser,
@@ -50,6 +53,65 @@ if not any(isinstance(h, logging.StreamHandler) for h in logger.handlers):
 logger.info(
     f"max_playwright_sender loaded pid={os.getpid()} ppid={os.getppid()} file={__file__} cwd={os.getcwd()} python={sys.executable} argv={sys.argv}"
 )
+
+# --- Diagnostic file logging ---
+# Keeps existing stdout/console logging AND additionally writes to logs/max_worker.log
+# using a rotating handler (20 MB x 5 files).
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+_DIAG_DIR = _LOG_DIR / "diagnostics"
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _DIAG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    pass
+
+if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    _file_handler = RotatingFileHandler(
+        _LOG_DIR / "max_worker.log",
+        maxBytes=20 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    _file_handler.setFormatter(JsonFormatter())
+    _file_handler.setLevel(logging.INFO)
+    logger.addHandler(_file_handler)
+
+# Request-scoped correlation context for diagnostic task logs.
+# Set in main.process_send_task (TASK_RECEIVED) and cleared at TASK_FINISHED.
+_current_task_id: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "max_current_task_id", default=None
+)
+_current_account_id: "contextvars.ContextVar[Optional[str]]" = contextvars.ContextVar(
+    "max_current_account_id", default=None
+)
+
+
+@contextmanager
+def _task_correlation(task_id: str, account_id: Optional[str] = None):
+    """Context manager that sets task correlation contextvars and emits TASK_RECEIVED / TASK_FINISHED.
+
+    Uses a synchronous context manager so it can be used directly inside async
+    functions. The contextvars propagate automatically to all awaited coroutines
+    within the ``with`` block (e.g. ``send_message`` -> ``_open_chat_by_phone``).
+    """
+    token_tid = _current_task_id.set(task_id)
+    token_acct = _current_account_id.set(account_id)
+    logger.info(json.dumps({
+        "event": "TASK_RECEIVED",
+        "task_id": task_id,
+        "account_id": account_id,
+    }, ensure_ascii=False, sort_keys=True))
+    try:
+        yield
+    finally:
+        logger.info(json.dumps({
+            "event": "TASK_FINISHED",
+            "task_id": task_id,
+            "account_id": account_id,
+        }, ensure_ascii=False, sort_keys=True))
+        _current_task_id.reset(token_tid)
+        _current_account_id.reset(token_acct)
+
 
 DEFAULT_USER_DATA_DIR = "./user_data"
 DEFAULT_BASE_URL = "https://web.max.ru"
@@ -91,6 +153,17 @@ _FIND_CONTACT_SUBMIT_SELECTORS = [
     "form#findContact ~ * button[type='submit']",
     "form#findContact button[type='submit']",
 ]
+# Only search / contact-picker clicks are surfaced from the page click sniffer,
+# so chat names and message text never reach the log file.
+_SEARCH_CLICK_KEYWORDS = (
+    "начать общение",
+    "найти",
+    "поиск",
+    "search",
+    "find",
+    "icon_plus",
+    "findcontact",
+)
 _MESSAGE_INPUT_SELECTORS = [
     "div[contenteditable='true'][role='textbox']",
     "div[contenteditable=''][role='textbox']",
@@ -275,6 +348,7 @@ class MaxBrowserManager:
         self._chat_by_phone: "OrderedDict[str, str]" = OrderedDict()
         self._phone_by_chat_id: "OrderedDict[str, str]" = OrderedDict()
         self._chat_status: Dict[str, Dict[str, Any]] = {}
+        self._diag_dir: Path = _DIAG_DIR
 
     def _startup_caller_tag(self) -> str:
         try:
@@ -453,6 +527,11 @@ class MaxBrowserManager:
             logger.info(
                 f"restart_enter n={startup_n} pid={pid} reason={reason} has_context={bool(self.context)} has_page={bool(self.page)}"
             )
+            self._log_event(
+                "BROWSER_RESTART",
+                reason=reason,
+                tasks_count=self.tasks_count,
+            )
             self._chat_status.clear()
             await self._close_page()
             await self._close_context()
@@ -489,10 +568,17 @@ class MaxBrowserManager:
         sniffer_path = Path(__file__).with_name("max_ws_sniffer.js")
         if sniffer_path.exists():
             await self.context.add_init_script(path=str(sniffer_path))
+        click_sniffer_path = Path(__file__).with_name("max_click_sniffer.js")
+        if click_sniffer_path.exists():
+            await self.context.add_init_script(path=str(click_sniffer_path))
         pages = self.context.pages
         page = pages[0] if pages else await self.context.new_page()
         try:
             await page.expose_function("__max_ws_sniffer_emit", self._on_ws_sniffer_emit)
+        except Exception:
+            pass
+        try:
+            await page.expose_function("__max_click_sniffer_emit", self._on_click_sniffer_emit)
         except Exception:
             pass
         if not page.url or page.url == "about:blank":
@@ -762,63 +848,154 @@ class MaxBrowserManager:
             except Exception:
                 pass
 
-    async def _wait_for_chat_or_not_found(self, page: Page, timeout_ms: int = 4000) -> str:
-        """Return 'chat', 'not_found', or 'timeout' within timeout_ms total."""
+    async def _wait_for_chat_or_not_found(self, page: Page, timeout_ms: int = 4000) -> Tuple[str, str]:
+        """Return ``(outcome, signal)`` within timeout_ms total.
+
+        outcome is 'chat', 'not_found' or 'timeout'.  signal records *what*
+        proved it: 'openedChat' or 'composer' for a chat, 'not_found_modal' for a
+        missing user, 'none' when the window expired.  The signal is what lets the
+        caller tell "chat opened" apart from "composer is ready for typing".
+        """
         deadline = asyncio.get_event_loop().time() + timeout_ms / 1000.0
-        chat_loc = page.locator(".openedChat, [class*='openedChat']")
+        chat_loc = page.locator(", ".join(_OPENED_CHAT_SELECTORS))
         while asyncio.get_event_loop().time() < deadline:
             if await self._is_user_not_found_modal(page):
-                return "not_found"
+                return "not_found", "not_found_modal"
             try:
                 if await chat_loc.count() > 0:
-                    return "chat"
+                    return "chat", "openedChat"
             except Exception:
                 pass
-            for sel in _MESSAGE_INPUT_SELECTORS[:4]:
-                try:
-                    handle = await page.query_selector(self._pw_selector(sel))
-                    if handle:
-                        return "chat"
-                except Exception:
-                    continue
+            if await self._probe_message_input(page):
+                return "chat", "composer"
             await asyncio.sleep(0.1)
         if await self._is_user_not_found_modal(page):
-            return "not_found"
-        return "timeout"
+            return "not_found", "not_found_modal"
+        return "timeout", "none"
+
+    async def _probe_message_input(
+        self,
+        page: Page,
+        selectors: Optional[Iterable[str]] = None,
+    ) -> Optional[str]:
+        """Return the first matching composer selector right now, or None.
+
+        A plain query_selector sweep (no waiting), so it is cheap enough to run
+        just to distinguish "chat opened" from "message box available".
+        """
+        candidates = list(_MESSAGE_INPUT_SELECTORS[:4] if selectors is None else selectors)
+        for sel in candidates:
+            try:
+                handle = await page.query_selector(self._pw_selector(sel))
+                if handle:
+                    return sel
+            except Exception:
+                continue
+        return None
+
+    async def _log_search_outcome(self, page: Page, via: str, search_start: float) -> None:
+        """Log whether the resolved chat is actually writable.
+
+        Splits the single "found" state into the two things that matter
+        operationally: the search resolved to a chat (SEARCH_CHAT_OPENED) and the
+        message box is available for typing (SEARCH_COMPOSER_READY vs
+        SEARCH_COMPOSER_MISSING).  SEARCH_FOUND then carries can_type so the log
+        answers "user found and writable" vs "user found but not writable".
+        """
+        self._log_event(
+            "SEARCH_CHAT_OPENED",
+            via=via,
+            duration_ms=self._elapsed_ms(search_start),
+        )
+
+        composer_selector = await self._probe_message_input(page)
+        if not composer_selector:
+            # Bounded probe: a healthy composer shows up almost immediately, and
+            # send_message's later 2.5s wait then resolves without extra delay.
+            composer_selector = await self._wait_and_get_first(
+                page, _MESSAGE_INPUT_SELECTORS, timeout_ms=1500
+            )
+
+        if composer_selector:
+            self._log_event(
+                "SEARCH_COMPOSER_READY",
+                via=via,
+                duration_ms=self._elapsed_ms(search_start),
+            )
+        else:
+            self._log_event(
+                "SEARCH_COMPOSER_MISSING",
+                via=via,
+                duration_ms=self._elapsed_ms(search_start),
+            )
+            await self._diag_snapshot(page, "composer_missing")
+
+        self._log_event(
+            "SEARCH_FOUND",
+            can_type=bool(composer_selector),
+            via=via,
+            duration_ms=self._elapsed_ms(search_start),
+        )
 
     async def _diag_snapshot(self, page: Page, prefix: str) -> None:
-        """Best-effort diagnostic snapshot for debugging selector wait failures."""
+        """Best-effort diagnostic snapshot for debugging selector wait failures.
+
+        Each field is collected independently so that a failure in one (e.g.
+        page closed mid-snapshot during a browser restart) does not discard
+        all the other diagnostic data.
+        """
+        url: str = "<unknown>"
+        title: str = "<unknown>"
+        buttons: Any = "<unknown>"
+        uses: Any = "<unknown>"
+        hrefs: Any = "<unknown>"
+        screenshot_path: str = "<not-attempted>"
+        html_path: str = "<not-attempted>"
+
         try:
             url = page.url
+        except Exception:
+            url = "<page-closed>"
+        try:
             title = await page.title()
+        except Exception:
+            title = "<page-closed>"
+        try:
             buttons = await page.locator("button").count()
+        except Exception:
+            buttons = "<page-closed>"
+        try:
             uses = await page.locator("use").count()
+        except Exception:
+            uses = "<page-closed>"
+        try:
             hrefs = await page.evaluate(
                 "() => [...new Set([...document.querySelectorAll('use')].map(u => u.getAttribute('href') || u.getAttribute('xlink:href') || ''))].slice(0, 20)"
             )
-            ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-            screenshot_path = f"/tmp/diag_{prefix}_{ts}.png"
-            html_path = f"/tmp/diag_{prefix}_{ts}.html"
-            try:
-                await page.screenshot(path=screenshot_path, full_page=True)
-            except Exception as se:
-                screenshot_path = f"<screenshot-failed:{se}>"
-            try:
-                Path(html_path).write_text(await page.content(), encoding="utf-8")
-            except Exception as he:
-                html_path = f"<html-failed:{he}>"
-            logger.error(
-                f"[DIAG:{prefix}] url={url} title={title!r} buttons={buttons} uses={uses} hrefs={hrefs} "
-                f"screenshot={screenshot_path} html={html_path}"
-            )
-            self._cleanup_diag_dumps(prefix=prefix)
-        except Exception as e:
-            logger.exception(f"[DIAG:{prefix}] snapshot collection failed: {e}")
+        except Exception:
+            hrefs = "<page-closed>"
+
+        ts = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+        screenshot_path = str(self._diag_dir / f"diag_{prefix}_{ts}.png")
+        html_path = str(self._diag_dir / f"diag_{prefix}_{ts}.html")
+        try:
+            await page.screenshot(path=screenshot_path, full_page=True)
+        except Exception as se:
+            screenshot_path = f"<screenshot-failed:{se}>"
+        try:
+            Path(html_path).write_text(await page.content(), encoding="utf-8")
+        except Exception as he:
+            html_path = f"<html-failed:{he}>"
+        logger.error(
+            f"[DIAG:{prefix}] url={url} title={title!r} buttons={buttons} uses={uses} hrefs={hrefs} "
+            f"screenshot={screenshot_path} html={html_path}"
+        )
+        self._cleanup_diag_dumps(prefix=prefix)
 
     def _cleanup_diag_dumps(self, prefix: str) -> None:
         try:
             now = datetime.utcnow()
-            candidates = list(Path("/tmp").glob("diag_*.*"))
+            candidates = list(self._diag_dir.glob("diag_*.*"))
             keep: List[Path] = []
             for p in candidates:
                 try:
@@ -838,8 +1015,130 @@ class MaxBrowserManager:
         except Exception:
             return
 
+    def _diag_fields(self) -> Dict[str, Any]:
+        """Build correlation fields (task_id, account_id) from the current task context."""
+        fields: Dict[str, Any] = {}
+        tid = _current_task_id.get()
+        if tid:
+            fields["task_id"] = tid
+        acct = _current_account_id.get()
+        if acct:
+            fields["account_id"] = acct
+        return fields
+
+    def _log_event(self, event: str, duration_ms: Optional[float] = None, **extra: Any) -> None:
+        """Emit a concise JSON diagnostic event for the current task context.
+
+        Does not log the phone number or message text. Timestamp is added by
+        JsonFormatter. task_id / account_id are added automatically when
+        available (via ``_task_correlation`` in main.py).
+        """
+        fields: Dict[str, Any] = {"event": event}
+        fields.update(self._diag_fields())
+        if duration_ms is not None:
+            fields["duration_ms"] = round(duration_ms, 1)
+        fields.update(extra)
+        logger.info(json.dumps(fields, ensure_ascii=False, sort_keys=True))
+
+    async def _is_auth_required_page(self, page: Page) -> bool:
+        """Best-effort diagnostic check: are we on a login/auth screen?
+
+        Purely observational — does not change search behavior. Returns True when
+        the current page URL indicates an auth flow (session expired / logged out).
+        """
+        try:
+            url = (page.url or "").lower()
+        except Exception:
+            return False
+        auth_markers = ("/login", "/signin", "/sign-in", "/auth", "passport", "/enter")
+        return any(marker in url for marker in auth_markers)
+
+    @staticmethod
+    def _is_search_click(data: Dict[str, Any]) -> bool:
+        """True when a sniffed click targets a search / contact-picker control."""
+        haystack = " ".join(
+            str(data.get(key) or "").lower()
+            for key in ("text", "aria", "icon", "href")
+        )
+        return any(keyword in haystack for keyword in _SEARCH_CLICK_KEYWORDS)
+
+    async def _on_click_sniffer_emit(self, data: Dict[str, Any]) -> None:
+        """Log search-related page clicks (manual or automated) as UI_CLICK.
+
+        The page-side sniffer (max_click_sniffer.js) reports every click; this
+        handler keeps only search / contact-picker controls so that chat names
+        and message text never reach the log file.
+        """
+        try:
+            if not isinstance(data, dict) or data.get("type") != "click":
+                return
+            if not self._is_search_click(data):
+                return
+            label = str(data.get("text") or data.get("aria") or "").strip()
+            self._log_event(
+                "UI_CLICK",
+                ui_tag=data.get("tag"),
+                ui_text=label[:80],
+                ui_icon=data.get("icon"),
+            )
+        except Exception as e:
+            logger.error(f"Click sniffer emit handler failed: {e}")
+
+    def _elapsed_ms(self, start: float) -> float:
+        return (asyncio.get_event_loop().time() - start) * 1000.0
+
+    async def _press_step(
+        self,
+        page: Page,
+        selector: str,
+        event: str,
+        fail_prefix: str,
+        search_start: float,
+        timeout_ms: int = 4000,
+    ) -> None:
+        """Log a UI press, click it, then log success or a failure snapshot.
+
+        Emits ``<event>_PRESS`` before the click and ``<event>_PRESSED`` after it,
+        so a press is always visible in the log even when the click itself fails.
+        On failure the original Playwright error is re-raised unchanged.
+        """
+        self._log_event(f"{event}_PRESS")
+        try:
+            await page.click(selector, timeout=timeout_ms)
+        except Exception:
+            self._log_event(f"{event}_CLICK_FAILED", duration_ms=self._elapsed_ms(search_start))
+            await self._diag_snapshot(page, fail_prefix)
+            raise
+        self._log_event(f"{event}_PRESSED")
+
+    async def _missing_step(
+        self,
+        page: Page,
+        event: str,
+        fail_prefix: str,
+        message: str,
+        search_start: float,
+    ) -> NoReturn:
+        """Log a missing-element step, snapshot the page, then raise."""
+        self._log_event(event, duration_ms=self._elapsed_ms(search_start))
+        await self._diag_snapshot(page, fail_prefix)
+        raise MaxMessengerError(message)
+
     async def _open_chat_by_phone(self, page: Page, phone: str) -> bool:
         logger.info(f"Opening chat for phone: {phone}")
+        _search_start = asyncio.get_event_loop().time()
+        self._log_event("SEARCH_START")
+
+        # Diagnostic: detect if we're stuck on an auth/login page instead of the chat UI.
+        # Purely observational, does not change search behavior.
+        if await self._is_auth_required_page(page):
+            self._log_event(
+                "SEARCH_AUTH_REQUIRED",
+                duration_ms=(asyncio.get_event_loop().time() - _search_start) * 1000.0,
+            )
+            await self._diag_snapshot(page, "search_auth_required")
+            raise MaxMessengerError("Authentication required: session expired or on login page.")
+
         if await self._is_user_not_found_modal(page):
             await self._dismiss_user_not_found_overlay(page)
 
@@ -852,47 +1151,125 @@ class MaxBrowserManager:
 
         open_selector = await self._wait_and_get_first(page, _SEARCH_PLUS_BUTTON_SELECTORS, timeout_ms=10000)
         if not open_selector:
-            await self._diag_snapshot(page, "plus_button_missing")
-            raise MaxMessengerError("Button 'Начать общение' not found.")
+            await self._missing_step(
+                page,
+                "SEARCH_PLUS_MISSING",
+                "plus_button_missing",
+                "Button 'Начать общение' not found.",
+                _search_start,
+            )
         await self._human_pause(1000, 4000)
-        await page.click(open_selector, timeout=5000)
+        await self._press_step(
+            page,
+            open_selector,
+            "SEARCH_PLUS",
+            "plus_click_failed",
+            _search_start,
+            timeout_ms=5000,
+        )
         await self._human_pause(2000, 5000)
 
         find_by_number_selector = await self._wait_and_get_first(page, _FIND_BY_NUMBER_ITEM_MENU_SELECTORS, timeout_ms=5000)
         if not find_by_number_selector:
-            raise MaxMessengerError("Menu item 'Найти по номеру' not found.")
-        await page.click(find_by_number_selector, timeout=4000)
+            await self._missing_step(
+                page,
+                "SEARCH_MENU_MISSING",
+                "find_by_number_missing",
+                "Menu item 'Найти по номеру' not found.",
+                _search_start,
+            )
+        await self._press_step(
+            page,
+            find_by_number_selector,
+            "SEARCH_MENU",
+            "find_by_number_click_failed",
+            _search_start,
+        )
 
         phone_input_selector = await self._wait_and_get_first(page, _CONTACT_NUMBER_INPUT_SELECTORS, timeout_ms=8000)
         if not phone_input_selector:
-            raise MaxMessengerError("Phone input not found.")
+            await self._missing_step(
+                page,
+                "SEARCH_PHONE_INPUT_MISSING",
+                "phone_input_missing",
+                "Phone input not found.",
+                _search_start,
+            )
 
         await page.fill(phone_input_selector, phone)
+        self._log_event("SEARCH_PHONE_FILLED")
         await self._human_pause(2000, 5000)
 
         submit_selector = await self._wait_and_get_first(page, _FIND_CONTACT_SUBMIT_SELECTORS, timeout_ms=8000)
         if not submit_selector:
-            raise MaxMessengerError("Submit button 'Найти в MAX' not found.")
-        await page.click(submit_selector, timeout=4000)
+            await self._missing_step(
+                page,
+                "SEARCH_SUBMIT_MISSING",
+                "submit_button_missing",
+                "Submit button 'Найти в MAX' not found.",
+                _search_start,
+            )
+        await self._press_step(
+            page,
+            submit_selector,
+            "SEARCH_SUBMIT",
+            "submit_click_failed",
+            _search_start,
+        )
+        self._log_event(
+            "SEARCH_SUBMITTED",
+            duration_ms=self._elapsed_ms(_search_start),
+        )
         await self._human_pause(1200, 28000)
 
-        outcome = await self._wait_for_chat_or_not_found(page, timeout_ms=4000)
+        outcome, signal = await self._wait_for_chat_or_not_found(page, timeout_ms=4000)
+
         if outcome == "not_found":
+            # Confirmed by the not-found modal: the user is not in MAX.
+            self._log_event(
+                "SEARCH_NOT_FOUND",
+                reason=signal,
+                duration_ms=self._elapsed_ms(_search_start),
+            )
             logger.info(f"User-not-found modal detected for phone={phone}")
             await self._dismiss_user_not_found_overlay(page)
             raise ContactNotFoundError(f"User not found by phone: {phone}")
+
         if outcome == "chat":
+            await self._log_search_outcome(page, signal, _search_start)
             return True
+
+        # No definitive signal yet, so refine BEFORE reporting an outcome. The old
+        # code logged SEARCH_TIMEOUT up front and then also SEARCH_NOT_FOUND, so one
+        # unresolved search looked like both a timeout and a missing user.
+        await self._diag_snapshot(page, "search_timeout")
 
         # Fallback: modal copy may differ; still do not burn 17×10s selector waits.
         if await self._wait_and_get_first(page, _USER_NOT_FOUND_SELECTORS, timeout_ms=400):
+            self._log_event(
+                "SEARCH_NOT_FOUND",
+                reason="modal_selector_fallback",
+                duration_ms=self._elapsed_ms(_search_start),
+            )
             await self._dismiss_user_not_found_overlay(page)
             raise ContactNotFoundError(f"User not found by phone: {phone}")
+
         chat_found = await self._wait_and_get_first(page, _OPENED_CHAT_SELECTORS + _MESSAGE_INPUT_SELECTORS, timeout_ms=1500)
-        if not chat_found:
-            await self._dismiss_user_not_found_overlay(page)
-            raise ContactNotFoundError(f"User not found by phone: {phone}")
-        return True
+        if chat_found:
+            await self._log_search_outcome(page, "timeout_fallback", _search_start)
+            return True
+
+        # Neither a chat nor a modal: nothing proved the user is missing. Kept as
+        # ContactNotFoundError for the caller, but logged as SEARCH_TIMEOUT with
+        # treated_as so it is not counted as a confirmed "not found".
+        self._log_event(
+            "SEARCH_TIMEOUT",
+            reason="no_chat_no_modal",
+            treated_as="not_found",
+            duration_ms=self._elapsed_ms(_search_start),
+        )
+        await self._dismiss_user_not_found_overlay(page)
+        raise ContactNotFoundError(f"User not found by phone: {phone}")
 
     async def _open_chat_by_chat_id(self, page: Page, chat_id: str, base_url: str) -> bool:
         logger.info(f"Opening existing chat by chat_id: {chat_id}")
@@ -1042,12 +1419,21 @@ class MaxBrowserManager:
                     if not message_selector:
                         if await self._is_user_not_found_modal(page):
                             await self._dismiss_user_not_found_overlay(page)
+                            # Not found, discovered after the search already returned
+                            # a chat: log it here or the event log stays silent.
+                            self._log_event("SEARCH_NOT_FOUND", reason="modal_after_open")
                             return SendMaxMessageResult(
                                 sent_ok=False,
                                 status_note="user_not_found_by_phone",
                                 error_message=f"User not found by phone: {phone}",
                             )
+                        # Chat exists but is not writable: distinct from "not found".
+                        self._log_event("SEARCH_COMPOSER_MISSING", reason="send_stage")
+                        await self._diag_snapshot(page, "send_input_missing")
                         return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message="Input field not found")
+
+                    _send_start = asyncio.get_event_loop().time()
+                    self._log_event("SEND_INPUT_FOUND")
 
                     if humanize:
                         await self._human_pause(200, 500)
@@ -1064,6 +1450,7 @@ class MaxBrowserManager:
                     await self._type_like_human(page, message_selector, randomized_text)
                     await self._human_pause(120, 320)
                     await page.keyboard.press("Enter")
+                    self._log_event("SEND_SUBMITTED")
                     try:
                         await page.wait_for_function(
                             """() => {
@@ -1075,7 +1462,16 @@ class MaxBrowserManager:
                             timeout=2500,
                         )
                     except PlaywrightTimeoutError:
-                        pass
+                        self._log_event(
+                            "SEND_DELIVERY_TIMEOUT",
+                            duration_ms=(asyncio.get_event_loop().time() - _send_start) * 1000.0,
+                        )
+                        await self._diag_snapshot(page, "send_delivery_timeout")
+                    else:
+                        self._log_event(
+                            "SEND_DELIVERED",
+                            duration_ms=(asyncio.get_event_loop().time() - _send_start) * 1000.0,
+                        )
 
                     await self._maybe_capture_chat_id(page, phone)
                     if phone not in self._chat_by_phone:
@@ -1092,6 +1488,10 @@ class MaxBrowserManager:
                         chat_id=captured_chat_id,
                     )
                 except ContactNotFoundError as e:
+                    # Propagated from _open_chat_by_phone: the not-found event was
+                    # already emitted there, but other raise sites stayed silent, so
+                    # record the outcome here too instead of losing it.
+                    self._log_event("SEARCH_NOT_FOUND", reason="contact_not_found_exception")
                     return SendMaxMessageResult(
                         sent_ok=False,
                         status_note="user_not_found_by_phone",
