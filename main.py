@@ -49,12 +49,59 @@ from media_cache_manager import MediaCacheManager
 # --- Configuration ---
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost/")
 ORCHESTRATOR_URL = os.getenv("ORCHESTRATOR_URL", "http://localhost:8080")
+# Authoritative sender-account identity (UUID from tenant_accounts.id).
+TENANT_ACCOUNT_ID = (os.getenv("TENANT_ACCOUNT_ID") or os.getenv("ACCOUNT_ID") or "").strip()
+RABBITMQ_SEND_EXCHANGE = (os.getenv("RABBITMQ_SEND_EXCHANGE") or "tasks.messages.direct").strip()
 QUEUE_SEND = "tasks.messages.send"
 QUEUE_SEND_EXISTING = "tasks.messages.send_existing_chat"
 QUEUE_POLL = "tasks.messages.poll_replies"
 QUEUE_RESULTS = "tasks.messages.results_replies_queue"
 QUEUE_NOTIFY = "tasks.messages.tenant_admin_notify"
 _NOTIFICATION_PREFIX = "🔔 Получены новые сообщения:"
+
+ERROR_INVALID_PHONE = "INVALID_PHONE"
+ERROR_USER_NOT_FOUND = "USER_NOT_FOUND_BY_PHONE"
+ERROR_SESSION_EXPIRED = "SESSION_EXPIRED"
+ERROR_WORKER_UNAVAILABLE = "WORKER_UNAVAILABLE"
+ERROR_MAX_UI = "MAX_UI_ERROR"
+ERROR_BROWSER = "BROWSER_ERROR"
+ERROR_DELIVERY_UNKNOWN = "DELIVERY_UNKNOWN"
+ERROR_ACCOUNT_MISMATCH = "ACCOUNT_MISMATCH"
+
+
+def account_send_queue(tenant_account_id: str) -> str:
+    return f"tasks.messages.send.account.{tenant_account_id}"
+
+
+def account_routing_key(tenant_account_id: str) -> str:
+    return f"account.{tenant_account_id}"
+
+
+def classify_send_error(status_note: str, error_message: str) -> str:
+    note = (status_note or "").strip().lower()
+    msg = (error_message or "").strip().lower()
+    if note == "user_not_found_by_phone":
+        return ERROR_USER_NOT_FOUND
+    if "session" in msg or "auth" in msg or "login" in msg or "не авториз" in msg:
+        return ERROR_SESSION_EXPIRED
+    if "browser" in msg or "playwright" in msg or "target closed" in msg or "page closed" in msg:
+        return ERROR_BROWSER
+    if note == "failed" or note:
+        return ERROR_MAX_UI
+    return ERROR_MAX_UI
+
+
+def resolve_user_data_dir(tenant_account_id: str) -> str:
+    """Per-account Playwright profile. Avoid accidental sharing via a global MAX_USER_DATA_DIR."""
+    explicit = (os.getenv("MAX_USER_DATA_DIR") or "").strip()
+    if tenant_account_id:
+        if explicit and tenant_account_id in explicit:
+            return explicit
+        return str(_PROJECT_ROOT / "user_data" / f"account_{tenant_account_id}")
+    if explicit:
+        return explicit
+    return str(_PROJECT_ROOT / "user_data")
+
 
 # --- Models ---
 class SendTask(BaseModel):
@@ -66,6 +113,8 @@ class SendTask(BaseModel):
     attachment_url: Optional[str] = None
     attachment_name: Optional[str] = None
     tenant_id: Optional[str] = None
+    tenant_account_id: Optional[str] = None
+    account_id: Optional[str] = None
     messenger_type: Optional[str] = None
     use_chat_id: bool = False
     chat_id: Optional[str] = None
@@ -74,7 +123,9 @@ class SendTask(BaseModel):
 class CallbackPayload(BaseModel):
     task_id: str
     status: str
+    error_code: str = ""
     error_message: str = ""
+    account_id: str = ""
     sent_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
 
 class PollTarget(BaseModel):
@@ -89,9 +140,13 @@ class TargetResult(BaseModel):
     target_id: Optional[str] = None
     campaign_id: Optional[str] = None
     tenant_id: Optional[str] = None
+    tenant_account_id: Optional[str] = None
+    account_id: Optional[str] = None
     phone_number: str
     status: str
     reply_text: Optional[str] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
     timestamp: str
     chat_id: Optional[str] = None
     messenger_type: Optional[str] = None
@@ -113,7 +168,20 @@ class TenantAdminNotificationTask(BaseModel):
 
 class MaxWorkerDaemon:
     def __init__(self):
-        self.browser_manager = MaxBrowserManager(headless=False)
+        self.tenant_account_id = TENANT_ACCOUNT_ID
+        if not self.tenant_account_id:
+            raise RuntimeError(
+                "TENANT_ACCOUNT_ID is required (UUID of tenant_accounts.id). "
+                "Each worker process must bind to exactly one sender account."
+            )
+        user_data_dir = resolve_user_data_dir(self.tenant_account_id)
+        # Ensure MaxBrowserManager (which prefers MAX_USER_DATA_DIR) uses this process's profile.
+        os.environ["MAX_USER_DATA_DIR"] = user_data_dir
+        logger.info(
+            f"Worker TENANT_ACCOUNT_ID={self.tenant_account_id!r} "
+            f"user_data_dir={user_data_dir!r} exchange={RABBITMQ_SEND_EXCHANGE!r}"
+        )
+        self.browser_manager = MaxBrowserManager(headless=False, user_data_dir=user_data_dir)
         self.http_client = httpx.AsyncClient(base_url=ORCHESTRATOR_URL, timeout=30.0)
         self.media_http_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
         self.media_cache = MediaCacheManager(cache_dir="media_cache", http_client=self.media_http_client)
@@ -166,6 +234,8 @@ class MaxWorkerDaemon:
                 "status": status,
                 "chat_id": chat_id,
                 "timestamp": str(event.get("timestamp") or datetime.utcnow().isoformat() + "Z"),
+                "tenant_account_id": self.tenant_account_id,
+                "account_id": self.tenant_account_id,
             }
             reply_text = event.get("reply_text")
             if isinstance(reply_text, str) and reply_text.strip():
@@ -173,7 +243,7 @@ class MaxWorkerDaemon:
                     continue
                 payload["reply_text"] = reply_text
             await self.publish_payload(payload)
-            logger.info(f"Forwarded WS event: status={status} chat_id={chat_id}")
+            logger.info(f"Forwarded WS event: status={status} chat_id={chat_id} tenant_account_id={self.tenant_account_id}")
 
     def format_notification_message(self, task: TenantAdminNotificationTask) -> str:
         lines = ["🔔 Получены новые сообщения:"]
@@ -241,15 +311,56 @@ class MaxWorkerDaemon:
             try:
                 body = json.loads(raw_body)
                 task = SendTask(**body)
-                logger.info(f"Processing send task: {task.task_id} for {task.phone} (attachment_url={task.attachment_url!r}, attachment_name={task.attachment_name!r})")
+                task_account = (task.tenant_account_id or task.account_id or "").strip()
+                logger.info(
+                    f"Processing send task: {task.task_id} for {task.phone} "
+                    f"tenant_account_id={task_account!r} worker={self.tenant_account_id!r} "
+                    f"(attachment_url={task.attachment_url!r}, attachment_name={task.attachment_name!r})"
+                )
 
-                with _task_correlation(task.task_id, task.tenant_id or None):
+                # Preserve existing diagnostic TASK_RECEIVED / TASK_FINISHED correlation.
+                with _task_correlation(task.task_id, self.tenant_account_id):
+                    if task_account and task_account != self.tenant_account_id:
+                        err_msg = (
+                            f"account mismatch: task.tenant_account_id={task_account} "
+                            f"worker={self.tenant_account_id}"
+                        )
+                        logger.error(err_msg)
+                        await self.publish_result(TargetResult(
+                            target_id=task.task_id,
+                            campaign_id=task.campaign_id,
+                            tenant_id=task.tenant_id,
+                            tenant_account_id=self.tenant_account_id,
+                            account_id=self.tenant_account_id,
+                            phone_number=task.phone,
+                            status="failed",
+                            error_code=ERROR_ACCOUNT_MISMATCH,
+                            error_message=err_msg,
+                            timestamp=datetime.utcnow().isoformat() + "Z",
+                        ))
+                        return
+
                     phone = normalize_phone_for_max(task.phone)
                     if not phone:
+                        await self.publish_result(TargetResult(
+                            target_id=task.task_id,
+                            campaign_id=task.campaign_id,
+                            tenant_id=task.tenant_id,
+                            tenant_account_id=self.tenant_account_id,
+                            account_id=self.tenant_account_id,
+                            phone_number=task.phone,
+                            status="failed",
+                            error_code=ERROR_INVALID_PHONE,
+                            error_message="Invalid phone format",
+                            timestamp=datetime.utcnow().isoformat() + "Z",
+                        ))
+                        # Legacy callback for non-retry final failures (no error_code race).
                         await self.send_callback(CallbackPayload(
                             task_id=task.task_id,
                             status="failed",
-                            error_message="Invalid phone format"
+                            error_code=ERROR_INVALID_PHONE,
+                            error_message="Invalid phone format",
+                            account_id=self.tenant_account_id,
                         ))
                         return
 
@@ -261,10 +372,18 @@ class MaxWorkerDaemon:
                             attachment_name=task.attachment_name,
                         )
                     except Exception as e:
-                        await self.send_callback(CallbackPayload(
-                            task_id=task.task_id,
+                        err_msg = f"Attachment download failed: {e}"
+                        await self.publish_result(TargetResult(
+                            target_id=task.task_id,
+                            campaign_id=task.campaign_id,
+                            tenant_id=task.tenant_id,
+                            tenant_account_id=self.tenant_account_id,
+                            account_id=self.tenant_account_id,
+                            phone_number=phone,
                             status="failed",
-                            error_message=f"Attachment download failed: {e}"
+                            error_code=ERROR_WORKER_UNAVAILABLE,
+                            error_message=err_msg,
+                            timestamp=datetime.utcnow().isoformat() + "Z",
                         ))
                         return
 
@@ -275,53 +394,100 @@ class MaxWorkerDaemon:
                         chat_id=task.chat_id,
                         use_chat_id=bool(task.use_chat_id and task.chat_id),
                     )
-                    await self.send_callback(CallbackPayload(
-                        task_id=task.task_id,
-                        status=result.status_note,
-                        error_message=result.error_message
-                    ))
 
                     if result.status_note == "user_not_found_by_phone":
                         await self.publish_result(TargetResult(
                             target_id=task.task_id,
                             campaign_id=task.campaign_id,
+                            tenant_id=task.tenant_id,
+                            tenant_account_id=self.tenant_account_id,
+                            account_id=self.tenant_account_id,
                             phone_number=phone,
                             status="user_not_found_by_phone",
+                            error_code=ERROR_USER_NOT_FOUND,
+                            error_message=result.error_message or None,
                             timestamp=datetime.utcnow().isoformat() + "Z",
+                        ))
+                        await self.send_callback(CallbackPayload(
+                            task_id=task.task_id,
+                            status="user_not_found_by_phone",
+                            error_code=ERROR_USER_NOT_FOUND,
+                            error_message=result.error_message,
+                            account_id=self.tenant_account_id,
                         ))
                         logger.info(f"Soft-fail USER_NOT_FOUND_BY_PHONE for target {task.task_id} phone={phone}")
                         return
 
-                    # Now, also publish to RESULTS_QUEUE with "sent" status!
                     if result.sent_ok:
                         if not result.chat_id:
-                            logger.error(f"Send succeeded but chat_id not captured for target {task.task_id} phone={phone}")
+                            logger.error(
+                                f"Send succeeded but chat_id not captured for target {task.task_id} phone={phone}"
+                            )
                         await self.publish_result(TargetResult(
                             target_id=task.task_id,
                             campaign_id=task.campaign_id,
+                            tenant_id=task.tenant_id,
+                            tenant_account_id=self.tenant_account_id,
+                            account_id=self.tenant_account_id,
                             phone_number=phone,
                             status="sent",
                             timestamp=datetime.utcnow().isoformat() + "Z",
-                            chat_id=result.chat_id
+                            chat_id=result.chat_id,
                         ))
+                        await self.send_callback(CallbackPayload(
+                            task_id=task.task_id,
+                            status=result.status_note,
+                            account_id=self.tenant_account_id,
+                            error_message=result.error_message,
+                        ))
+                        return
+
+                    # Technical failure: ResultConsumer owns retry/cooldown (publish only).
+                    err_code = classify_send_error(result.status_note, result.error_message)
+                    await self.publish_result(TargetResult(
+                        target_id=task.task_id,
+                        campaign_id=task.campaign_id,
+                        tenant_id=task.tenant_id,
+                        tenant_account_id=self.tenant_account_id,
+                        account_id=self.tenant_account_id,
+                        phone_number=phone,
+                        status="failed",
+                        error_code=err_code,
+                        error_message=result.error_message or None,
+                        timestamp=datetime.utcnow().isoformat() + "Z",
+                    ))
 
             except Exception as e:
                 logger.exception("Error in process_send_task")
-                # Try to extract a task_id so we can report a failure callback.
+                # Ambiguous outcome — do not blind-retry across accounts.
                 try:
                     body = json.loads(raw_body)
                     task_id = body.get("task_id")
+                    campaign_id = body.get("campaign_id")
+                    tenant_id = body.get("tenant_id")
+                    phone = body.get("phone") or ""
                 except Exception:
                     task_id = None
+                    campaign_id = None
+                    tenant_id = None
+                    phone = ""
                 if task_id:
+                    err_msg = f"worker exception: {e}"
                     try:
-                        await self.send_callback(CallbackPayload(
-                            task_id=task_id,
-                            status="failed",
-                            error_message=f"worker exception: {e}",
+                        await self.publish_result(TargetResult(
+                            target_id=task_id,
+                            campaign_id=campaign_id,
+                            tenant_id=tenant_id,
+                            tenant_account_id=self.tenant_account_id,
+                            account_id=self.tenant_account_id,
+                            phone_number=phone,
+                            status="delivery_unknown",
+                            error_code=ERROR_DELIVERY_UNKNOWN,
+                            error_message=err_msg,
+                            timestamp=datetime.utcnow().isoformat() + "Z",
                         ))
-                    except Exception as cb_err:
-                        logger.error(f"Failed to send failure callback: {cb_err}")
+                    except Exception as pub_err:
+                        logger.error(f"Failed to publish delivery_unknown result: {pub_err}")
 
     async def process_poll_task(self, message: aio_pika.IncomingMessage):
         async with message.process():
@@ -391,7 +557,10 @@ class MaxWorkerDaemon:
                 logger.exception("Error in process_poll_task")
 
     async def run(self):
-        logger.info("Starting Max Worker Daemon...")
+        logger.info(
+            f"Starting Max Worker Daemon TENANT_ACCOUNT_ID={self.tenant_account_id!r} "
+            f"exchange={RABBITMQ_SEND_EXCHANGE!r}..."
+        )
         await self.browser_manager.start()
         
         try:
@@ -402,17 +571,28 @@ class MaxWorkerDaemon:
                 self.publish_channel = channel
                 await channel.set_qos(prefetch_count=1)
 
-                send_queue = await channel.declare_queue(QUEUE_SEND, durable=True)
-                existing_queue = await channel.declare_queue(QUEUE_SEND_EXISTING, durable=True)
+                exchange = await channel.declare_exchange(
+                    RABBITMQ_SEND_EXCHANGE,
+                    aio_pika.ExchangeType.DIRECT,
+                    durable=True,
+                )
+                send_queue_name = account_send_queue(self.tenant_account_id)
+                routing_key = account_routing_key(self.tenant_account_id)
+                send_queue = await channel.declare_queue(send_queue_name, durable=True)
+                await send_queue.bind(exchange, routing_key=routing_key)
+
                 poll_queue = await channel.declare_queue(QUEUE_POLL, durable=True)
                 results_queue = await channel.declare_queue(QUEUE_RESULTS, durable=True)
                 notify_queue = await channel.declare_queue(QUEUE_NOTIFY, durable=True)
 
-                logger.info(f"Waiting for messages on {QUEUE_SEND}, {QUEUE_SEND_EXISTING}, {QUEUE_POLL}, {QUEUE_NOTIFY}...")
-                
-                # Consume from all queues
+                logger.info(
+                    f"Waiting for messages on {send_queue_name} "
+                    f"(exchange={RABBITMQ_SEND_EXCHANGE} rk={routing_key}), "
+                    f"{QUEUE_POLL}, {QUEUE_NOTIFY}... "
+                    f"(note: SEND is account-isolated; poll/notify remain shared)"
+                )
+
                 await send_queue.consume(self.process_send_task)
-                await existing_queue.consume(self.process_send_task)
                 await poll_queue.consume(self.process_poll_task)
                 await notify_queue.consume(self.process_notify_task)
 
@@ -430,6 +610,7 @@ class MaxWorkerDaemon:
                 self._ws_forwarder_task = None
             await self.browser_manager.stop()
             await self.http_client.aclose()
+            await self.media_http_client.aclose()
 #just main
 if __name__ == "__main__":
     daemon = MaxWorkerDaemon()
