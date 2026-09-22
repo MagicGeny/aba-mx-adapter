@@ -399,9 +399,6 @@ class MaxBrowserManager:
                 logger.info(f"startup_page_begin n={startup_n} pid={pid} caller={caller}")
                 await self._bootstrap_page(startup_n=startup_n, caller=caller)
                 logger.info(f"startup_page_ok n={startup_n} pid={pid} caller={caller}")
-            if not self._restart_task:
-                self._restart_task = asyncio.create_task(self._scheduled_restart_loop())
-                logger.info(f"startup_restart_loop_started n={startup_n} pid={pid} caller={caller}")
             logger.info(
                 f"startup_exit n={startup_n} pid={pid} caller={caller} has_context={bool(self.context)} has_page={bool(self.page)}"
             )
