@@ -56,7 +56,10 @@ QUEUE_SEND = "tasks.messages.send"
 QUEUE_SEND_EXISTING = "tasks.messages.send_existing_chat"
 QUEUE_POLL = "tasks.messages.poll_replies"
 QUEUE_RESULTS = "tasks.messages.results_replies_queue"
-QUEUE_NOTIFY = "tasks.messages.tenant_admin_notify"
+# Legacy shared admin-notification queue. Kept only for documentation: it is no
+# longer declared or consumed, because one shared queue lets an unrelated MAX
+# account consume (and send) another account's admin notification.
+QUEUE_NOTIFY_LEGACY = "tasks.messages.tenant_admin_notify"
 _NOTIFICATION_PREFIX = "🔔 Получены новые сообщения:"
 
 ERROR_INVALID_PHONE = "INVALID_PHONE"
@@ -75,6 +78,29 @@ def account_send_queue(tenant_account_id: str) -> str:
 
 def account_routing_key(tenant_account_id: str) -> str:
     return f"account.{tenant_account_id}"
+
+
+def account_notify_queue(tenant_account_id: str) -> str:
+    """Per-account tenant-admin notification queue.
+
+    Admin notifications are published over the default exchange with this queue
+    name as the routing key, so only the owning account's worker can consume them.
+    """
+    return f"tasks.messages.tenant_admin_notify.account.{tenant_account_id}"
+
+
+def notify_task_targets_account(task_account_id: Optional[str], worker_account_id: str) -> bool:
+    """True only when a notification explicitly targets this worker's account.
+
+    Admin notifications must be sent by the MAX account that observed the
+    replies, so a missing or foreign ``tenant_account_id`` is rejected instead of
+    being processed by whichever worker happens to consume the message.
+    """
+    task_account = (task_account_id or "").strip()
+    worker_account = (worker_account_id or "").strip()
+    if not task_account or not worker_account:
+        return False
+    return task_account == worker_account
 
 
 def classify_send_error(status_note: str, error_message: str) -> str:
@@ -160,6 +186,9 @@ class ClientReplyInfo(BaseModel):
 class TenantAdminNotificationTask(BaseModel):
     tenant_phone: str
     tenant_id: Optional[str] = None
+    # Sender account (tenant_accounts.id) that must send this notification.
+    # Required for account isolation: the task must identify its worker.
+    tenant_account_id: Optional[str] = None
     chat_id: Optional[str] = None
     use_chat_id: bool = False
     replies: List[ClientReplyInfo]
@@ -260,7 +289,21 @@ class MaxWorkerDaemon:
             async with message.process():
                 body = json.loads(message.body.decode())
                 task = TenantAdminNotificationTask(**body)
-                logger.info(f"Processing notify task for tenant: {task.tenant_phone} (tenant_id={task.tenant_id!r}, use_chat_id={task.use_chat_id}, chat_id={task.chat_id!r}) with {len(task.replies)} replies")
+                logger.info(
+                    f"Processing notify task for tenant: {task.tenant_phone} "
+                    f"(tenant_id={task.tenant_id!r}, tenant_account_id={task.tenant_account_id!r}, "
+                    f"use_chat_id={task.use_chat_id}, chat_id={task.chat_id!r}) with {len(task.replies)} replies"
+                )
+
+                # Account isolation: only the account that observed the replies may
+                # send this notification. A missing or foreign tenant_account_id is
+                # rejected instead of being sent by whichever worker is free.
+                if not notify_task_targets_account(task.tenant_account_id, self.tenant_account_id):
+                    logger.error(
+                        f"Rejecting admin notify task for tenant_account_id={task.tenant_account_id!r}: "
+                        f"worker TENANT_ACCOUNT_ID={self.tenant_account_id!r} (account isolation)"
+                    )
+                    return
 
                 phone = normalize_phone_for_max(task.tenant_phone)
                 if not phone:
@@ -290,6 +333,10 @@ class MaxWorkerDaemon:
                             target_id=None,
                             campaign_id=None,
                             tenant_id=task.tenant_id or None,
+                            # The sender account is required so the orchestrator can
+                            # persist admin_chat_phone_mappings for THIS account.
+                            tenant_account_id=self.tenant_account_id,
+                            account_id=self.tenant_account_id,
                             phone_number=phone,
                             status="sent",
                             timestamp=datetime.utcnow().isoformat() + "Z",
@@ -583,13 +630,16 @@ class MaxWorkerDaemon:
 
                 poll_queue = await channel.declare_queue(QUEUE_POLL, durable=True)
                 results_queue = await channel.declare_queue(QUEUE_RESULTS, durable=True)
-                notify_queue = await channel.declare_queue(QUEUE_NOTIFY, durable=True)
+                # Account-isolated admin notifications: this worker consumes ONLY its
+                # own queue, so it can never send another account's notification.
+                notify_queue_name = account_notify_queue(self.tenant_account_id)
+                notify_queue = await channel.declare_queue(notify_queue_name, durable=True)
 
                 logger.info(
                     f"Waiting for messages on {send_queue_name} "
                     f"(exchange={RABBITMQ_SEND_EXCHANGE} rk={routing_key}), "
-                    f"{QUEUE_POLL}, {QUEUE_NOTIFY}... "
-                    f"(note: SEND is account-isolated; poll/notify remain shared)"
+                    f"{QUEUE_POLL}, {notify_queue_name}... "
+                    f"(note: SEND and NOTIFY are account-isolated; poll remains shared)"
                 )
 
                 await send_queue.consume(self.process_send_task)
