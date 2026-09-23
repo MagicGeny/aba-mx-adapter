@@ -235,30 +235,12 @@ _ATTACHMENT_PREVIEW_READY_JS = """
 """
 
 _IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".heic", ".heif", ".tiff", ".tif"}
-_SAFE_INVISIBLE_CHARS = [
-    "\u200B",  # Zero-Width Space
-    "\u200C",  # Zero-Width Non-Joiner
-    "\u200E",  # Left-to-Right Mark
-    "\u200F",  # Right-to-Left Mark
-]
 
 
 def _is_image_file(path: Path) -> bool:
     ext = path.suffix.lower()
     return ext in _IMAGE_EXTENSIONS
 
-
-def _randomize_text_with_invisible_chars(text: str) -> str:
-    """Добавляет к тексту суффикс из 3–21 рандомных безопасных невидимых символов."""
-    if not text:
-        return text
-
-    suffix_len = random.randint(3, 21)
-    suffix = "".join(
-        random.choice(_SAFE_INVISIBLE_CHARS) for _ in range(suffix_len)
-    )
-
-    return text + suffix
 
 #"div[placeholder*='Messagne'
 _OPENED_CHAT_SELECTORS = [".openedChat", "[class*='openedChat']"]
@@ -1379,10 +1361,6 @@ class MaxBrowserManager:
                 try:
                     page = await self._ensure_page()
                     self.tasks_count += 1
-                    if self.tasks_count > self.max_tasks:
-                        logger.info(f"Task limit ({self.max_tasks}) reached. Restarting browser...")
-                        await self._restart_browser("task_limit")
-                        page = await self._ensure_page()
 
                     try:
                         await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
@@ -1435,8 +1413,6 @@ class MaxBrowserManager:
                     if humanize:
                         await self._human_pause(200, 500)
 
-                    randomized_text = _randomize_text_with_invisible_chars(text)
-
                     await page.click(message_selector, timeout=3000)
                     if attachment_path:
                         try:
@@ -1444,7 +1420,7 @@ class MaxBrowserManager:
                         except Exception as e:
                             return SendMaxMessageResult(sent_ok=False, status_note="failed", error_message=str(e))
 
-                    await self._type_like_human(page, message_selector, randomized_text)
+                    await self._type_like_human(page, message_selector, text)
                     await self._human_pause(120, 320)
                     await page.keyboard.press("Enter")
                     self._log_event("SEND_SUBMITTED")
@@ -1522,10 +1498,6 @@ class MaxBrowserManager:
                 try:
                     page = await self._ensure_page()
                     self.tasks_count += 1
-                    if self.tasks_count > self.max_tasks:
-                        logger.info(f"Task limit ({self.max_tasks}) reached. Restarting browser...")
-                        await self._restart_browser("task_limit")
-                        page = await self._ensure_page()
 
                     try:
                         await page.goto(base_url, wait_until="domcontentloaded", timeout=45000)
